@@ -40,12 +40,12 @@ class VideoProcessor:
         """Setup Redis connection for progress updates."""
         try:
             redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-            self.redis_client = redis.from_url(redis_url)
+            self.redis_client = redis.from_url(redis_url, decode_responses=True)
             # Test connection
             self.redis_client.ping()
             logger.info("Redis connection established")
         except Exception as e:
-            logger.warning(f"Redis connection failed: {e}")
+            logger.warning(f"Redis connection failed: {e}. Progress updates will be disabled.")
             self.redis_client = None
     
     def ensure_directories(self):
@@ -118,13 +118,19 @@ class VideoProcessor:
     def _update_progress(self, job_id: str, progress: int, status: str = "processing", message: str = ""):
         """Update job progress in Redis."""
         if self.redis_client:
-            progress_data = {
-                'status': status,
-                'progress': progress,
-                'message': message,
-                'timestamp': datetime.utcnow().isoformat()
-            }
-            self.redis_client.set(f"job:{job_id}", json.dumps(progress_data), ex=3600)  # Expire in 1 hour
+            try:
+                progress_data = {
+                    'status': status,
+                    'progress': progress,
+                    'message': message,
+                    'timestamp': datetime.utcnow().isoformat()
+                }
+                self.redis_client.set(f"job:{job_id}", json.dumps(progress_data), ex=3600)  # Expire in 1 hour
+                logger.debug(f"Updated progress for job {job_id}: {progress}%")
+            except Exception as e:
+                logger.warning(f"Failed to update progress in Redis for job {job_id}: {e}")
+        else:
+            logger.debug(f"Redis unavailable, skipping progress update for job {job_id}: {progress}%")
     
     def _apply_text_overlay(self, input_stream, text_overlay: TextOverlay, video_size: Tuple[int, int]):
         """Apply text overlay using FFmpeg drawtext filter."""

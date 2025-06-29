@@ -18,8 +18,12 @@ router = APIRouter()
 # Redis connection for job queue
 def get_redis():
     """Get Redis connection."""
-    redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-    return redis.from_url(redis_url)
+    try:
+        redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+        return redis.from_url(redis_url, decode_responses=True)
+    except Exception as e:
+        logger.error(f"Failed to create Redis connection: {e}")
+        return None
 
 def estimate_processing_time(request: CompositionRequest) -> int:
     """
@@ -209,17 +213,20 @@ async def create_composition(
         # Try to add to Redis queue as well (optional)
         try:
             r = get_redis()
-            r.lpush("video_jobs", json.dumps({
-                "job_id": job.id,
-                "api_key": current_user.api_key,
-                "created_at": job.created_at.isoformat()
-            }))
+            if r is not None:
+                r.lpush("video_jobs", json.dumps({
+                    "job_id": job.id,
+                    "api_key": current_user.api_key,
+                    "created_at": job.created_at.isoformat()
+                }))
+            else:
+                logger.warning("Redis client is unavailable, skipping queue operation")
         except Exception as e:
             logger.warning(f"Failed to add job to Redis queue: {str(e)}")
             # Continue without Redis - the background task will still run
         
         return ComposeResponse(
-            job_id=job.id,
+            job_id=str(job.id),
             message=f"Video composition job '{request.title}' has been queued for processing",
             estimated_time=estimated_time
         )
@@ -266,7 +273,10 @@ async def get_queue_status(
         redis_queue_length = None
         try:
             r = get_redis()
-            redis_queue_length = r.llen("video_jobs")
+            if r is not None:
+                redis_queue_length = r.llen("video_jobs")
+            else:
+                logger.warning("Redis client is unavailable")
         except Exception as e:
             logger.warning(f"Failed to get Redis queue length: {str(e)}")
         

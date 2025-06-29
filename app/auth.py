@@ -1,4 +1,4 @@
-from fastapi import HTTPException, Security, Depends
+from fastapi import HTTPException, Security, Depends, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from typing import List, Optional
 import os
@@ -11,13 +11,23 @@ logger = logging.getLogger(__name__)
 security = HTTPBearer()
 
 # Redis configuration
-redis_client = redis.StrictRedis(
-    host=os.getenv("REDIS_HOST", "localhost"),
-    port=int(os.getenv("REDIS_PORT", 6379)),
-    db=int(os.getenv("REDIS_DB", 0)),
-    password=os.getenv("REDIS_PASSWORD", None),
-    decode_responses=True
-)
+def get_redis_client():
+    """Get Redis client with proper error handling."""
+    try:
+        redis_url = os.getenv("REDIS_URL")
+        if redis_url:
+            return redis.from_url(redis_url, decode_responses=True)
+        else:
+            return redis.StrictRedis(
+                host=os.getenv("REDIS_HOST", "localhost"),
+                port=int(os.getenv("REDIS_PORT", 6379)),
+                db=int(os.getenv("REDIS_DB", 0)),
+                password=os.getenv("REDIS_PASSWORD", None),
+                decode_responses=True
+            )
+    except Exception as e:
+        logger.error(f"Failed to create Redis client: {e}")
+        return None
 
 def get_api_keys() -> List[str]:
     """
@@ -27,6 +37,11 @@ def get_api_keys() -> List[str]:
         List[str]: List of valid API keys
     """
     try:
+        redis_client = get_redis_client()
+        if not redis_client:
+            logger.warning("Redis client unavailable. Falling back to environment variable.")
+            return load_keys_from_env()
+        
         api_keys = redis_client.lrange("api_keys", 0, -1)
         if not api_keys:
             logger.warning("No API keys found in Redis. Falling back to environment variable.")
@@ -35,6 +50,9 @@ def get_api_keys() -> List[str]:
         return api_keys
     except redis.RedisError as e:
         logger.error(f"Redis error: {e}. Falling back to environment variable.")
+        return load_keys_from_env()
+    except Exception as e:
+        logger.error(f"Unexpected error getting API keys: {e}. Falling back to environment variable.")
         return load_keys_from_env()
 
 def load_keys_from_env() -> List[str]:
@@ -90,22 +108,40 @@ def verify_api_key(credentials: HTTPAuthorizationCredentials = Security(security
     return token
 
 # Optional authentication for some endpoints
-def verify_api_key_optional(credentials: Optional[HTTPAuthorizationCredentials] = Security(security, auto_error=False)) -> Optional[str]:
+def verify_api_key_optional(request: Request) -> Optional[str]:
     """
     Verify the provided API key, but don't require it (for optional auth endpoints).
     
     Args:
-        credentials: HTTP authorization credentials (optional)
+        request: FastAPI request object
         
     Returns:
         Optional[str]: The validated API key if provided and valid, None otherwise
     """
-    if not credentials:
-        return None
-    
     try:
-        return verify_api_key(credentials)
-    except HTTPException:
+        # Check for Authorization header
+        auth_header = request.headers.get("Authorization")
+        if not auth_header:
+            return None
+        
+        # Parse Bearer token
+        if not auth_header.startswith("Bearer "):
+            return None
+        
+        token = auth_header.split(" ", 1)[1] if len(auth_header.split(" ", 1)) > 1 else None
+        if not token:
+            return None
+        
+        # Verify token
+        valid_keys = get_api_keys()
+        if token in valid_keys:
+            logger.debug(f"Valid API key authenticated (optional): {token[:10]}...")
+            return token
+        else:
+            logger.debug(f"Invalid API key attempted (optional): {token[:10]}...")
+            return None
+    except Exception as e:
+        logger.debug(f"Error in optional API key verification: {e}")
         return None
 
 class AuthenticatedUser:
@@ -158,6 +194,11 @@ def add_api_key(api_key: str) -> bool:
         bool: True if successful, False otherwise
     """
     try:
+        redis_client = get_redis_client()
+        if not redis_client:
+            logger.error("Redis client unavailable. Cannot add API key.")
+            return False
+        
         redis_client.lpush("api_keys", api_key)
         logger.info(f"Added API key: {api_key[:10]}...")
         return True
@@ -176,6 +217,11 @@ def remove_api_key(api_key: str) -> bool:
         bool: True if successful, False otherwise
     """
     try:
+        redis_client = get_redis_client()
+        if not redis_client:
+            logger.error("Redis client unavailable. Cannot remove API key.")
+            return False
+        
         result = redis_client.lrem("api_keys", 0, api_key)
         if result > 0:
             logger.info(f"Removed API key: {api_key[:10]}...")
@@ -198,6 +244,11 @@ def rotate_api_keys(new_keys: List[str]) -> bool:
         bool: True if successful, False otherwise
     """
     try:
+        redis_client = get_redis_client()
+        if not redis_client:
+            logger.error("Redis client unavailable. Cannot rotate API keys.")
+            return False
+        
         # Delete existing keys and add new ones atomically
         with redis_client.pipeline() as pipe:
             pipe.delete("api_keys")
@@ -218,6 +269,11 @@ def get_api_key_count() -> int:
         int: Number of API keys, -1 if Redis error
     """
     try:
+        redis_client = get_redis_client()
+        if not redis_client:
+            logger.error("Redis client unavailable. Cannot get API key count.")
+            return -1
+        
         return redis_client.llen("api_keys")
     except redis.RedisError as e:
         logger.error(f"Failed to get API key count from Redis: {e}")
@@ -232,10 +288,18 @@ def initialize_api_keys_from_env() -> bool:
         bool: True if successful, False otherwise
     """
     try:
+        redis_client = get_redis_client()
+        if not redis_client:
+            logger.warning("Redis client unavailable. Skipping Redis initialization.")
+            return True  # Not a failure, just no Redis
+        
         if redis_client.llen("api_keys") == 0:
             env_keys = load_keys_from_env()
             return rotate_api_keys(env_keys)
         return True
     except redis.RedisError as e:
         logger.error(f"Failed to initialize API keys from env: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Unexpected error initializing API keys from env: {e}")
         return False
