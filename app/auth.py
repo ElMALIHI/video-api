@@ -3,33 +3,56 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from typing import List, Optional
 import os
 import logging
+import redis
 
 logger = logging.getLogger(__name__)
 
 # Security scheme
 security = HTTPBearer()
 
+# Redis configuration
+redis_client = redis.StrictRedis(
+    host=os.getenv("REDIS_HOST", "localhost"),
+    port=int(os.getenv("REDIS_PORT", 6379)),
+    db=int(os.getenv("REDIS_DB", 0)),
+    password=os.getenv("REDIS_PASSWORD", None),
+    decode_responses=True
+)
+
 def get_api_keys() -> List[str]:
     """
-    Get the list of valid API keys from environment variables.
+    Get the list of valid API keys from Redis or environment variables.
+    
+    Returns:
+        List[str]: List of valid API keys
+    """
+    try:
+        api_keys = redis_client.lrange("api_keys", 0, -1)
+        if not api_keys:
+            logger.warning("No API keys found in Redis. Falling back to environment variable.")
+            return load_keys_from_env()
+        logger.info(f"Loaded {len(api_keys)} API key(s) from Redis")
+        return api_keys
+    except redis.RedisError as e:
+        logger.error(f"Redis error: {e}. Falling back to environment variable.")
+        return load_keys_from_env()
+
+def load_keys_from_env() -> List[str]:
+    """
+    Load API keys from environment variables.
     
     Returns:
         List[str]: List of valid API keys
     """
     api_keys_str = os.getenv("API_KEYS", "")
     if not api_keys_str:
-        # For development, return a default key
         default_key = "dev-api-key-12345"
         logger.warning(f"No API_KEYS environment variable set. Using default key: {default_key}")
         return [default_key]
-    
-    # Split by comma and strip whitespace
     api_keys = [key.strip() for key in api_keys_str.split(",") if key.strip()]
-    
     if not api_keys:
         raise ValueError("API_KEYS environment variable is empty or invalid")
-    
-    logger.info(f"Loaded {len(api_keys)} API key(s)")
+    logger.info(f"Loaded {len(api_keys)} API key(s) from environment")
     return api_keys
 
 def verify_api_key(credentials: HTTPAuthorizationCredentials = Security(security)) -> str:
@@ -122,3 +145,97 @@ def get_current_user_optional(api_key: Optional[str] = Depends(verify_api_key_op
     if api_key:
         return AuthenticatedUser(api_key)
     return None
+
+# API Key Management Functions for Redis
+def add_api_key(api_key: str) -> bool:
+    """
+    Add a new API key to Redis.
+    
+    Args:
+        api_key: The API key to add
+        
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    try:
+        redis_client.lpush("api_keys", api_key)
+        logger.info(f"Added API key: {api_key[:10]}...")
+        return True
+    except redis.RedisError as e:
+        logger.error(f"Failed to add API key to Redis: {e}")
+        return False
+
+def remove_api_key(api_key: str) -> bool:
+    """
+    Remove an API key from Redis.
+    
+    Args:
+        api_key: The API key to remove
+        
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    try:
+        result = redis_client.lrem("api_keys", 0, api_key)
+        if result > 0:
+            logger.info(f"Removed API key: {api_key[:10]}...")
+            return True
+        else:
+            logger.warning(f"API key not found for removal: {api_key[:10]}...")
+            return False
+    except redis.RedisError as e:
+        logger.error(f"Failed to remove API key from Redis: {e}")
+        return False
+
+def rotate_api_keys(new_keys: List[str]) -> bool:
+    """
+    Replace all API keys in Redis with new ones (key rotation).
+    
+    Args:
+        new_keys: List of new API keys
+        
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    try:
+        # Delete existing keys and add new ones atomically
+        with redis_client.pipeline() as pipe:
+            pipe.delete("api_keys")
+            for key in new_keys:
+                pipe.lpush("api_keys", key)
+            pipe.execute()
+        logger.info(f"Rotated API keys. New count: {len(new_keys)}")
+        return True
+    except redis.RedisError as e:
+        logger.error(f"Failed to rotate API keys in Redis: {e}")
+        return False
+
+def get_api_key_count() -> int:
+    """
+    Get the count of API keys stored in Redis.
+    
+    Returns:
+        int: Number of API keys, -1 if Redis error
+    """
+    try:
+        return redis_client.llen("api_keys")
+    except redis.RedisError as e:
+        logger.error(f"Failed to get API key count from Redis: {e}")
+        return -1
+
+def initialize_api_keys_from_env() -> bool:
+    """
+    Initialize Redis with API keys from environment if Redis is empty.
+    This is useful for first-time setup or fallback scenarios.
+    
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    try:
+        if redis_client.llen("api_keys") == 0:
+            env_keys = load_keys_from_env()
+            return rotate_api_keys(env_keys)
+        return True
+    except redis.RedisError as e:
+        logger.error(f"Failed to initialize API keys from env: {e}")
+        return False

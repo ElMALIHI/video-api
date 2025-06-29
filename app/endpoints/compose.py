@@ -87,18 +87,11 @@ async def process_video_job(job_id: int, composition_data: str, api_key: str):
         composition_dict = json.loads(composition_data)
         request = CompositionRequest(**composition_dict)
         
-        # Progress callback to update job status
-        def update_progress(progress: float, message: str):
-            job.progress = progress
-            db.commit()
-            logger.info(f"Job {job_id} progress: {progress}% - {message}")
+        # Process the video using new FFmpeg-based processor
+        video_processor.compose_video(request, str(job_id))
         
-        # Process the video
-        output_path = video_processor.process_composition(
-            request, 
-            job_id, 
-            progress_callback=update_progress
-        )
+        # Set output path (the video processor saves to media/renders/{job_id}.mp4)
+        output_path = f"media/renders/{job_id}.mp4"
         
         # Update job as completed
         job.status = "completed"

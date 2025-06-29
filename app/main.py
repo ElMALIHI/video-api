@@ -11,6 +11,7 @@ load_dotenv()
 
 # Import endpoints
 from app.endpoints import upload, compose, jobs, health
+from app.auth import initialize_api_keys_from_env
 
 # Configure logging
 logging.basicConfig(
@@ -57,6 +58,18 @@ async def global_exception_handler(request: Request, exc: Exception):
         status_code=500,
         content={"detail": "Internal server error"}
     )
+
+# Startup event
+@app.on_event("startup")
+async def startup_event():
+    """Initialize the application on startup."""
+    logger.info("Starting Video Composition API...")
+    
+    # Initialize API keys from environment if Redis is empty
+    if initialize_api_keys_from_env():
+        logger.info("API keys initialized successfully")
+    else:
+        logger.error("Failed to initialize API keys")
 
 # Include routers
 app.include_router(health.router, prefix="/api/v1", tags=["health"])

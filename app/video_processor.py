@@ -1,32 +1,56 @@
 import os
 import logging
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-from moviepy.editor import *
-from moviepy.config import check
 import json
+import tempfile
+import subprocess
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Callable
 from datetime import datetime
+import ffmpeg
+import redis
+import uuid
 
-from app.models import CompositionRequest, Scene, Transition, TextOverlay, Position
+from app.models import ComposeRequest, Scene, Transition, TextOverlay, Position
 
 logger = logging.getLogger(__name__)
 
 # Configuration
-OUTPUT_DIR = os.getenv("OUTPUT_DIR", "./outputs")
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "./uploads")
 TEMP_DIR = os.getenv("TEMP_DIR", "./temp")
+RENDERS_DIR = Path("media/renders")
 
 class VideoProcessor:
     """
-    Video processor that handles video composition using MoviePy.
+    Video processor that handles video composition using FFmpeg-python.
+    
+    The processor supports:
+    - Concatenating video scenes
+    - Applying transitions via xfade
+    - Overlaying text on video
+    - Mixing audio tracks
+    - Adding visual effects (brightness, saturation, etc.)
     """
     
     def __init__(self):
+        self.redis_client = None
         self.ensure_directories()
+        self._setup_redis()
+    
+    def _setup_redis(self):
+        """Setup Redis connection for progress updates."""
+        try:
+            redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+            self.redis_client = redis.from_url(redis_url)
+            # Test connection
+            self.redis_client.ping()
+            logger.info("Redis connection established")
+        except Exception as e:
+            logger.warning(f"Redis connection failed: {e}")
+            self.redis_client = None
     
     def ensure_directories(self):
         """Ensure all required directories exist."""
-        for directory in [OUTPUT_DIR, TEMP_DIR]:
+        for directory in [TEMP_DIR, RENDERS_DIR, Path(UPLOAD_DIR)]:
             Path(directory).mkdir(parents=True, exist_ok=True)
     
     def get_file_path(self, file_id: str) -> str:
@@ -91,330 +115,291 @@ class VideoProcessor:
         
         return (x, y)
     
-    def create_text_clip(self, text_overlay: TextOverlay, video_size: Tuple[int, int], scene_duration: float) -> TextClip:
-        """
-        Create a text clip from text overlay specification.
-        
-        Args:
-            text_overlay: Text overlay configuration
-            video_size: Video dimensions
-            scene_duration: Duration of the scene
-            
-        Returns:
-            TextClip: MoviePy text clip
-        """
-        # Convert position
+    def _update_progress(self, job_id: str, progress: int, status: str = "processing", message: str = ""):
+        """Update job progress in Redis."""
+        if self.redis_client:
+            progress_data = {
+                'status': status,
+                'progress': progress,
+                'message': message,
+                'timestamp': datetime.utcnow().isoformat()
+            }
+            self.redis_client.set(f"job:{job_id}", json.dumps(progress_data), ex=3600)  # Expire in 1 hour
+    
+    def _apply_text_overlay(self, input_stream, text_overlay: TextOverlay, video_size: Tuple[int, int]):
+        """Apply text overlay using FFmpeg drawtext filter."""
         x, y = self.convert_position(text_overlay.position, video_size)
         
-        # Determine text duration
-        if text_overlay.duration:
-            duration = text_overlay.duration
-        else:
-            duration = scene_duration
+        # Convert hex color to format FFmpeg understands
+        color = text_overlay.color.replace('#', '0x')
         
-        # Create text clip
-        txt_clip = TextClip(
-            text_overlay.text,
-            fontsize=text_overlay.font_size,
-            color=text_overlay.color,
-            font='Arial',  # You might want to make this configurable
-            stroke_color=text_overlay.background_color if text_overlay.background_color else None,
-            stroke_width=2 if text_overlay.background_color else 0
-        ).set_duration(duration).set_position((x, y))
-        
-        # Set start time if specified
-        if text_overlay.start_time:
-            txt_clip = txt_clip.set_start(text_overlay.start_time)
-        
-        return txt_clip
-    
-    def process_scene(self, scene: Scene, video_settings: Dict, scene_index: int) -> VideoFileClip:
-        """
-        Process a single scene.
-        
-        Args:
-            scene: Scene configuration
-            video_settings: Video settings from composition request
-            scene_index: Index of the scene
-            
-        Returns:
-            VideoFileClip: Processed scene clip
-        """
-        logger.info(f"Processing scene {scene.id} (index {scene_index})")
-        
-        # Get media file path
-        media_path = self.get_file_path(scene.media.file_id)
-        
-        # Load media based on type
-        if scene.media.type == "image":
-            # Create image clip
-            clip = ImageClip(media_path)
-            
-            # Set duration - use scene duration or default to 5 seconds
-            duration = scene.duration if scene.duration else 5.0
-            clip = clip.set_duration(duration)
-            
-        elif scene.media.type == "video":
-            # Load video clip
-            clip = VideoFileClip(media_path)
-            
-            # Apply start/end time if specified
-            if scene.media.start_time is not None:
-                if scene.media.end_time is not None:
-                    clip = clip.subclip(scene.media.start_time, scene.media.end_time)
-                else:
-                    clip = clip.subclip(scene.media.start_time)
-            elif scene.media.end_time is not None:
-                clip = clip.subclip(0, scene.media.end_time)
-            
-            # Apply scene duration if specified
-            if scene.duration:
-                clip = clip.set_duration(scene.duration)
-        
-        else:
-            raise ValueError(f"Unsupported media type: {scene.media.type}")
-        
-        # Resize to target resolution
-        target_size = (video_settings['width'], video_settings['height'])
-        clip = clip.resize(target_size)
-        
-        # Apply media effects
-        if scene.media.effects:
-            effects = scene.media.effects
-            
-            if effects.zoom and effects.zoom != 1.0:
-                clip = clip.resize(effects.zoom)
-            
-            if effects.speed and effects.speed != 1.0:
-                clip = clip.fx(speedx, effects.speed)
-            
-            if effects.brightness and effects.brightness != 1.0:
-                clip = clip.fx(colorx, effects.brightness)
-        
-        # Add text overlays
-        clips_to_composite = [clip]
-        
-        if scene.text_overlays:
-            for text_overlay in scene.text_overlays:
-                txt_clip = self.create_text_clip(text_overlay, target_size, clip.duration)
-                clips_to_composite.append(txt_clip)
-        
-        # Add scene audio if specified
-        if scene.audio:
-            try:
-                audio_path = self.get_file_path(scene.audio.file_id)
-                audio_clip = AudioFileClip(audio_path)
-                
-                # Apply audio settings
-                if scene.audio.volume != 1.0:
-                    audio_clip = audio_clip.volumex(scene.audio.volume)
-                
-                # Apply fade in/out
-                if scene.audio.fade_in:
-                    audio_clip = audio_clip.audio_fadein(scene.audio.fade_in)
-                if scene.audio.fade_out:
-                    audio_clip = audio_clip.audio_fadeout(scene.audio.fade_out)
-                
-                # Set audio duration to match clip
-                audio_clip = audio_clip.set_duration(clip.duration)
-                
-                # Composite the clips
-                if len(clips_to_composite) > 1:
-                    final_clip = CompositeVideoClip(clips_to_composite)
-                else:
-                    final_clip = clip
-                
-                final_clip = final_clip.set_audio(audio_clip)
-                
-            except Exception as e:
-                logger.warning(f"Failed to add audio to scene {scene.id}: {str(e)}")
-                final_clip = CompositeVideoClip(clips_to_composite) if len(clips_to_composite) > 1 else clip
-        else:
-            final_clip = CompositeVideoClip(clips_to_composite) if len(clips_to_composite) > 1 else clip
-        
-        logger.info(f"Scene {scene.id} processed successfully, duration: {final_clip.duration}s")
-        return final_clip
-    
-    def apply_transition(self, clip1: VideoFileClip, clip2: VideoFileClip, transition: Transition) -> VideoFileClip:
-        """
-        Apply transition between two clips.
-        
-        Args:
-            clip1: First clip
-            clip2: Second clip  
-            transition: Transition configuration
-            
-        Returns:
-            VideoFileClip: Clips with transition applied
-        """
-        logger.info(f"Applying {transition.type} transition ({transition.duration}s)")
-        
-        if transition.type == "fade":
-            # Fade out first clip and fade in second clip
-            clip1_with_fadeout = clip1.fadeout(transition.duration)
-            clip2_with_fadein = clip2.fadein(transition.duration)
-            
-            # Overlap the clips during transition
-            clip2_with_fadein = clip2_with_fadein.set_start(clip1.duration - transition.duration)
-            
-            return concatenate_videoclips([clip1_with_fadeout, clip2_with_fadein])
-        
-        elif transition.type in ["slide_left", "slide_right", "slide_up", "slide_down"]:
-            # For slides, we'll use a simple crossfade for now
-            # In a full implementation, you'd implement actual sliding effects
-            logger.warning(f"Slide transitions not fully implemented, using crossfade")
-            return concatenate_videoclips([clip1, clip2], method="compose")
-        
-        else:
-            # Default: simple concatenation
-            logger.warning(f"Transition type {transition.type} not implemented, using simple cut")
-            return concatenate_videoclips([clip1, clip2])
-    
-    def process_composition(self, request: CompositionRequest, job_id: int, progress_callback=None) -> str:
-        """
-        Process the complete video composition.
-        
-        Args:
-            request: Video composition request
-            job_id: Job identifier for output filename
-            progress_callback: Optional callback for progress updates
-            
-        Returns:
-            str: Path to output video file
-        """
-        logger.info(f"Starting video composition for job {job_id}")
-        
-        if progress_callback:
-            progress_callback(10, "Processing scenes...")
-        
-        # Process all scenes
-        scene_clips = []
-        video_settings = {
-            'width': request.settings.width,
-            'height': request.settings.height,
-            'fps': request.settings.fps
+        # Build drawtext filter
+        drawtext_params = {
+            'text': text_overlay.text.replace(':', '\\:').replace("'", "\\'"),
+            'fontcolor': color,
+            'fontsize': text_overlay.font_size,
+            'x': int(x),
+            'y': int(y)
         }
         
-        for i, scene in enumerate(request.scenes):
-            try:
-                clip = self.process_scene(scene, video_settings, i)
-                scene_clips.append(clip)
+        if text_overlay.start_time is not None:
+            drawtext_params['enable'] = f'gte(t,{text_overlay.start_time})'
+            if text_overlay.duration is not None:
+                end_time = text_overlay.start_time + text_overlay.duration
+                drawtext_params['enable'] += f'*lt(t,{end_time})'
+        
+        return input_stream.filter('drawtext', **drawtext_params)
+    
+    def _apply_video_effects(self, input_stream, effects):
+        """Apply video effects using FFmpeg filters."""
+        if not effects:
+            return input_stream
+        
+        filters = []
+        
+        # Brightness and saturation effects
+        eq_params = {}
+        if effects.brightness is not None:
+            eq_params['brightness'] = effects.brightness - 1.0  # FFmpeg eq filter expects adjustment from 0
+        if hasattr(effects, 'saturation') and effects.saturation is not None:
+            eq_params['saturation'] = effects.saturation
+        
+        if eq_params:
+            input_stream = input_stream.filter('eq', **eq_params)
+        
+        # Speed effects
+        if effects.speed is not None and effects.speed != 1.0:
+            input_stream = input_stream.filter('setpts', f'PTS/{effects.speed}')
+        
+        # Zoom effects (scale filter)
+        if effects.zoom is not None and effects.zoom != 1.0:
+            input_stream = input_stream.filter('scale', f'iw*{effects.zoom}', f'ih*{effects.zoom}')
+        
+        return input_stream
+    
+    def _apply_transitions(self, clips, transitions: List[Transition]):
+        """Apply transitions between clips using FFmpeg xfade filter."""
+        if not transitions or len(clips) < 2:
+            return ffmpeg.concat(*clips, v=1, a=1) if len(clips) > 1 else clips[0]
+        
+        # Create transition map
+        transition_map = {}
+        for transition in transitions:
+            transition_map[(transition.from_scene, transition.to_scene)] = transition
+        
+        result = clips[0]
+        
+        for i in range(1, len(clips)):
+            # Check if there's a transition defined for this clip pair
+            transition_key = (f"scene_{i-1}", f"scene_{i}")  # Simplified scene ID mapping
+            
+            if transition_key in transition_map:
+                transition = transition_map[transition_key]
                 
-                if progress_callback:
-                    progress = 10 + (i + 1) * 40 / len(request.scenes)
-                    progress_callback(progress, f"Processed scene {i + 1}/{len(request.scenes)}")
+                # Apply xfade transition
+                if transition.type == "fade":
+                    result = ffmpeg.filter([result, clips[i]], 'xfade', 
+                                         transition='fade', 
+                                         duration=transition.duration, 
+                                         offset=0)
+                elif transition.type == "dissolve":
+                    result = ffmpeg.filter([result, clips[i]], 'xfade', 
+                                         transition='dissolve', 
+                                         duration=transition.duration, 
+                                         offset=0)
+                elif transition.type == "wipe":
+                    result = ffmpeg.filter([result, clips[i]], 'xfade', 
+                                         transition='wipeleft', 
+                                         duration=transition.duration, 
+                                         offset=0)
+                else:
+                    # Default fade for unsupported transitions
+                    result = ffmpeg.filter([result, clips[i]], 'xfade', 
+                                         transition='fade', 
+                                         duration=transition.duration, 
+                                         offset=0)
+            else:
+                # No transition, just concat
+                result = ffmpeg.concat(result, clips[i], v=1, a=1)
+        
+        return result
+    
+    def compose_video(self, compose_request: ComposeRequest, job_id: str):
+        """
+        Compose video using FFmpeg-python based on the compose request.
+        
+        Args:
+            compose_request: The request object containing video composition details
+            job_id: Unique job identifier for file naming
+        """
+        output_file = RENDERS_DIR / f"{job_id}.mp4"
+        logger.info(f"Starting video composition for job {job_id}")
+        
+        self._update_progress(job_id, 0, "started", "Initializing video composition")
+        
+        try:
+            video_streams = []
+            audio_streams = []
+            
+            # Process each scene
+            for index, scene in enumerate(compose_request.scenes):
+                logger.info(f"Processing scene {scene.id}")
+                self._update_progress(job_id, int((index / len(compose_request.scenes)) * 40), 
+                                    "processing", f"Processing scene {scene.id}")
+                
+                # Get input file
+                file_path = self.get_file_path(scene.media.file_id)
+                input_stream = ffmpeg.input(file_path)
+                
+                # Get video stream
+                video_stream = input_stream.video
+                
+                # Apply trim if needed
+                if scene.media.start_time is not None or scene.media.end_time is not None:
+                    trim_params = {}
+                    if scene.media.start_time is not None:
+                        trim_params['start'] = scene.media.start_time
+                    if scene.media.end_time is not None:
+                        trim_params['end'] = scene.media.end_time
+                    video_stream = video_stream.filter('trim', **trim_params)
+                    video_stream = video_stream.filter('setpts', 'PTS-STARTPTS')
+                
+                # Apply duration if specified
+                if scene.duration is not None:
+                    video_stream = video_stream.filter('trim', duration=scene.duration)
+                    video_stream = video_stream.filter('setpts', 'PTS-STARTPTS')
+                
+                # Resize to target resolution
+                video_stream = video_stream.filter('scale', 
+                                                  compose_request.settings.width, 
+                                                  compose_request.settings.height)
+                
+                # Apply video effects
+                if scene.media.effects:
+                    video_stream = self._apply_video_effects(video_stream, scene.media.effects)
+                
+                # Apply text overlays
+                if scene.text_overlays:
+                    video_size = (compose_request.settings.width, compose_request.settings.height)
+                    for text_overlay in scene.text_overlays:
+                        video_stream = self._apply_text_overlay(video_stream, text_overlay, video_size)
+                
+                video_streams.append(video_stream)
+                
+                # Handle audio
+                audio_stream = input_stream.audio
+                
+                # Apply same timing constraints to audio
+                if scene.media.start_time is not None or scene.media.end_time is not None:
+                    atrim_params = {}
+                    if scene.media.start_time is not None:
+                        atrim_params['start'] = scene.media.start_time
+                    if scene.media.end_time is not None:
+                        atrim_params['end'] = scene.media.end_time
+                    audio_stream = audio_stream.filter('atrim', **atrim_params)
+                    audio_stream = audio_stream.filter('asetpts', 'PTS-STARTPTS')
+                
+                if scene.duration is not None:
+                    audio_stream = audio_stream.filter('atrim', duration=scene.duration)
+                    audio_stream = audio_stream.filter('asetpts', 'PTS-STARTPTS')
+                
+                # Apply scene audio settings
+                if scene.audio:
+                    try:
+                        scene_audio_path = self.get_file_path(scene.audio.file_id)
+                        scene_audio_stream = ffmpeg.input(scene_audio_path).audio
+                        
+                        # Apply volume
+                        if scene.audio.volume != 1.0:
+                            scene_audio_stream = scene_audio_stream.filter('volume', scene.audio.volume)
+                        
+                        # Apply fade in/out
+                        if scene.audio.fade_in:
+                            scene_audio_stream = scene_audio_stream.filter('afade', type='in', duration=scene.audio.fade_in)
+                        if scene.audio.fade_out:
+                            scene_audio_stream = scene_audio_stream.filter('afade', type='out', duration=scene.audio.fade_out)
+                        
+                        # Mix with original audio
+                        audio_stream = ffmpeg.filter([audio_stream, scene_audio_stream], 'amix')
+                    except Exception as e:
+                        logger.warning(f"Failed to add scene audio: {e}")
+                
+                audio_streams.append(audio_stream)
+            
+            self._update_progress(job_id, 50, "processing", "Applying transitions")
+            
+            # Apply transitions if specified
+            if compose_request.transitions:
+                final_video = self._apply_transitions(video_streams, compose_request.transitions)
+                # For audio, simple concatenation for now
+                final_audio = ffmpeg.concat(*audio_streams, v=0, a=1) if len(audio_streams) > 1 else audio_streams[0]
+            else:
+                # Simple concatenation
+                if len(video_streams) > 1:
+                    final_video = ffmpeg.concat(*video_streams, v=1, a=0)
+                    final_audio = ffmpeg.concat(*audio_streams, v=0, a=1)
+                else:
+                    final_video = video_streams[0]
+                    final_audio = audio_streams[0]
+            
+            self._update_progress(job_id, 70, "processing", "Adding background music")
+            
+            # Add background music
+            if compose_request.global_audio and compose_request.global_audio.background_music:
+                try:
+                    music = compose_request.global_audio.background_music
+                    music_path = self.get_file_path(music.music_ID)
+                    background_audio = ffmpeg.input(music_path).audio
                     
-            except Exception as e:
-                logger.error(f"Failed to process scene {scene.id}: {str(e)}")
-                raise
-        
-        if progress_callback:
-            progress_callback(50, "Applying transitions...")
-        
-        # Apply transitions
-        if request.transitions and len(scene_clips) > 1:
-            # Build a map of transitions
-            transition_map = {(t.from_scene, t.to_scene): t for t in request.transitions}
+                    # Apply volume
+                    background_audio = background_audio.filter('volume', music.volume)
+                    
+                    # Apply fade effects
+                    if music.fade_in:
+                        background_audio = background_audio.filter('afade', type='in', duration=music.fade_in)
+                    if music.fade_out:
+                        background_audio = background_audio.filter('afade', type='out', duration=music.fade_out)
+                    
+                    # Mix with existing audio using amix filter
+                    final_audio = ffmpeg.filter([final_audio, background_audio], 'amix', inputs=2)
+                    
+                except Exception as e:
+                    logger.warning(f"Failed to add background music: {e}")
             
-            final_clips = [scene_clips[0]]
+            self._update_progress(job_id, 90, "processing", "Rendering final video")
             
-            for i in range(1, len(scene_clips)):
-                from_scene = request.scenes[i-1].id
-                to_scene = request.scenes[i].id
-                
-                if (from_scene, to_scene) in transition_map:
-                    transition = transition_map[(from_scene, to_scene)]
-                    # For now, just concatenate with a simple crossfade
-                    # In a full implementation, you'd apply the specific transition
-                    final_clips.append(scene_clips[i])
-                else:
-                    final_clips.append(scene_clips[i])
+            # Set quality parameters based on settings
+            output_params = {
+                'vcodec': 'libx264',
+                'acodec': 'aac',
+                'r': compose_request.settings.fps
+            }
             
-            final_video = concatenate_videoclips(final_clips)
-        else:
-            final_video = concatenate_videoclips(scene_clips)
-        
-        if progress_callback:
-            progress_callback(70, "Adding background music...")
-        
-        # Add background music if specified
-        if request.global_audio and request.global_audio.background_music:
-            try:
-                music = request.global_audio.background_music
-                music_path = self.get_file_path(music.music_ID)
-                background_audio = AudioFileClip(music_path)
-                
-                # Apply volume
-                background_audio = background_audio.volumex(music.volume)
-                
-                # Loop if necessary
-                if music.loop and background_audio.duration < final_video.duration:
-                    background_audio = background_audio.loop(duration=final_video.duration)
-                else:
-                    background_audio = background_audio.set_duration(final_video.duration)
-                
-                # Apply fade in/out
-                if music.fade_in:
-                    background_audio = background_audio.audio_fadein(music.fade_in)
-                if music.fade_out:
-                    background_audio = background_audio.audio_fadeout(music.fade_out)
-                
-                # Composite with existing audio
-                if final_video.audio:
-                    final_audio = CompositeAudioClip([final_video.audio, background_audio])
-                else:
-                    final_audio = background_audio
-                
-                final_video = final_video.set_audio(final_audio)
-                
-            except Exception as e:
-                logger.warning(f"Failed to add background music: {str(e)}")
-        
-        if progress_callback:
-            progress_callback(80, "Finalizing video...")
-        
-        # Set final video properties
-        final_video = final_video.set_fps(request.settings.fps)
-        
-        # Generate output filename
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_filename = f"video_job_{job_id}_{timestamp}.{request.output.format}"
-        output_path = Path(OUTPUT_DIR) / output_filename
-        
-        if progress_callback:
-            progress_callback(90, "Rendering video...")
-        
-        # Write video file
-        codec = request.output.codec if request.output.codec == "h264" else "libx264"
-        
-        # Quality settings
-        if request.settings.quality == "high":
-            bitrate = "5000k"
-        elif request.settings.quality == "medium":
-            bitrate = "2500k"
-        else:
-            bitrate = "1000k"
-        
-        final_video.write_videofile(
-            str(output_path),
-            codec=codec,
-            bitrate=bitrate,
-            temp_audiofile_path=str(Path(TEMP_DIR) / f"temp_audio_{job_id}.m4a"),
-            remove_temp=True,
-            verbose=False,
-            logger=None  # Disable moviepy logging to avoid conflicts
-        )
-        
-        # Cleanup
-        final_video.close()
-        for clip in scene_clips:
-            clip.close()
-        
-        if progress_callback:
-            progress_callback(100, "Video composition completed!")
-        
-        logger.info(f"Video composition completed: {output_path}")
-        return str(output_path)
+            if compose_request.settings.quality == "high":
+                output_params['crf'] = 18
+                output_params['preset'] = 'slow'
+            elif compose_request.settings.quality == "medium":
+                output_params['crf'] = 23
+                output_params['preset'] = 'medium'
+            else:  # low
+                output_params['crf'] = 28
+                output_params['preset'] = 'fast'
+            
+            # Render final video
+            (ffmpeg
+             .output(final_video, final_audio, str(output_file), **output_params)
+             .overwrite_output()
+             .run(capture_stdout=True, capture_stderr=True)
+            )
+            
+            self._update_progress(job_id, 100, "completed", "Video composition completed successfully")
+            logger.info(f"Video composition completed: {output_file}")
+            
+        except Exception as e:
+            error_msg = f"Video composition failed: {str(e)}"
+            logger.error(error_msg, exc_info=True)
+            self._update_progress(job_id, 0, "failed", error_msg)
+            raise
 
 # Global processor instance
 video_processor = VideoProcessor()

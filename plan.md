@@ -149,7 +149,7 @@ Tech Stack (Minimal)
 Backend: FastAPI
 Database: SQLite (for job storage)
 Queue: Redis (for job processing)
-Video Processing: MoviePy
+Video Processing: ffmpeg
 Authentication: Multiple API keys (Bearer token)
 Deployment: Docker + docker-compose
 

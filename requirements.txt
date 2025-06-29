@@ -1,12 +1,12 @@
 # Core dependencies
-fastapi>=0.104.0
-uvicorn[standard]>=0.24.0
-pydantic>=2.5.0
-python-multipart>=0.0.6
-moviepy>=1.0.3
-redis>=5.0.0
-rq>=1.15.0
-python-dotenv>=1.0.0
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic==2.5.2
+python-multipart==0.0.6
+ffmpeg-python==0.2.0   # FFmpeg bindings
+redis==5.0.1
+celery==5.3.4          # for background jobs
+python-dotenv==1.0.0   # env handling
 sqlalchemy>=2.0.0
 aiofiles>=23.0.0
 
