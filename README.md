@@ -54,7 +54,7 @@ video-api/
 
 1. **Clone the Repository:**
    ```bash
-   git clone <repository-url>
+   git clone https://github.com/ElMALIHI/video-api.git
    cd video-api
    ```
 
