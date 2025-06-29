@@ -51,7 +51,18 @@ class VideoProcessor:
     def ensure_directories(self):
         """Ensure all required directories exist."""
         for directory in [TEMP_DIR, RENDERS_DIR, Path(UPLOAD_DIR)]:
-            Path(directory).mkdir(parents=True, exist_ok=True)
+            directory_path = Path(directory)
+            directory_path.mkdir(parents=True, exist_ok=True)
+            # Ensure the directory is writable
+            try:
+                if directory_path.exists():
+                    # Test write permissions by creating a temporary file
+                    test_file = directory_path / ".write_test"
+                    test_file.touch()
+                    test_file.unlink()  # Remove test file
+                    logger.debug(f"Directory {directory} is writable")
+            except Exception as e:
+                logger.warning(f"Directory {directory} may not be writable: {e}")
     
     def get_file_path(self, file_id: str) -> str:
         """
@@ -292,10 +303,25 @@ class VideoProcessor:
                 
                 video_streams.append(video_stream)
                 
-                # Handle audio
-                audio_stream = input_stream.audio
+                # Handle audio - check if media has audio based on file extension
+                file_extension = file_path.lower().split('.')[-1]
+                has_audio = file_extension in ['mp4', 'avi', 'mov', 'mkv', 'mp3', 'wav', 'aac', 'flac', 'm4a']
+                
+                if has_audio:
+                    try:
+                        audio_stream = input_stream.audio
+                    except Exception as e:
+                        logger.warning(f"Expected audio in {file_path} but none found, creating silent audio")
+                        duration = scene.duration if scene.duration else 5.0
+                        audio_stream = ffmpeg.input('anullsrc=channel_layout=stereo:sample_rate=48000', f='lavfi', t=duration).audio
+                else:
+                    logger.info(f"No audio expected for {file_path}, creating silent audio")
+                    duration = scene.duration if scene.duration else 5.0
+                    audio_stream = ffmpeg.input('anullsrc=channel_layout=stereo:sample_rate=48000', f='lavfi', t=duration).audio
                 
                 # Apply same timing constraints to audio
+                audio_needs_pts_reset = False
+                
                 if scene.media.start_time is not None or scene.media.end_time is not None:
                     atrim_params = {}
                     if scene.media.start_time is not None:
@@ -303,11 +329,20 @@ class VideoProcessor:
                     if scene.media.end_time is not None:
                         atrim_params['end'] = scene.media.end_time
                     audio_stream = audio_stream.filter('atrim', **atrim_params)
-                    audio_stream = audio_stream.filter('asetpts', 'PTS-STARTPTS')
+                    audio_needs_pts_reset = True
                 
                 if scene.duration is not None:
                     audio_stream = audio_stream.filter('atrim', duration=scene.duration)
+                    audio_needs_pts_reset = True
+                
+                # Apply asetpts only once if needed with unique identifier
+                if audio_needs_pts_reset:
+                    # Add unique identifier to avoid filter conflicts
+                    unique_adjustment = 1.0 + (index * 0.0001)  # Minimal volume adjustment for uniqueness
                     audio_stream = audio_stream.filter('asetpts', 'PTS-STARTPTS')
+                    audio_stream = audio_stream.filter('volume', unique_adjustment)
+                    # Ensure proper stream separation to avoid multiple outgoing edges
+                    audio_stream = audio_stream.filter('anull')
                 
                 # Apply scene audio settings
                 if scene.audio:
@@ -334,23 +369,50 @@ class VideoProcessor:
                 if scene.voiceover:
                     try:
                         voiceover_path = self.get_file_path(scene.voiceover.file_id)
-                        voiceover_stream = ffmpeg.input(voiceover_path).audio
+                        logger.info(f"Adding voiceover from: {voiceover_path}")
+                        # Create a fresh input for each scene to avoid filter conflicts
+                        voiceover_input = ffmpeg.input(voiceover_path)
+                        voiceover_stream = voiceover_input.audio
+                        
+                        # Add a unique pass-through filter to ensure stream uniqueness
+                        unique_id = f"scene_{index}_voiceover"
+                        voiceover_stream = voiceover_stream.filter('anull')
 
                         # Apply volume
                         if scene.voiceover.volume != 1.0:
                             voiceover_stream = voiceover_stream.filter('volume', scene.voiceover.volume)
 
                         # Apply timing constraints
+                        voiceover_needs_pts_reset = False
+                        
                         if scene.voiceover.start_time is not None:
-                            voiceover_stream = voiceover_stream.filter('adelay', delay=str(int(scene.voiceover.start_time * 1000)) + '|all=1')
+                            delay_ms = int(scene.voiceover.start_time * 1000)
+                            voiceover_stream = voiceover_stream.filter('adelay', delays=f'{delay_ms}|{delay_ms}')
+                            
                         if scene.voiceover.duration is not None:
                             voiceover_stream = voiceover_stream.filter('atrim', duration=scene.voiceover.duration)
+                            voiceover_needs_pts_reset = True
+                        
+                        # Apply asetpts only once if needed with unique label
+                        if voiceover_needs_pts_reset:
+                            # Add a unique volume adjustment to create distinct filter paths
+                            unique_vol = 1.0 + (index * 0.0001)  # Tiny volume difference to create unique paths
                             voiceover_stream = voiceover_stream.filter('asetpts', 'PTS-STARTPTS')
+                            voiceover_stream = voiceover_stream.filter('volume', unique_vol)
+                            # Ensure proper stream separation to avoid multiple outgoing edges
+                            voiceover_stream = voiceover_stream.filter('anull')
 
-                        # Mix with original audio
-                        audio_stream = ffmpeg.filter([audio_stream, voiceover_stream], 'amix')
+                        # Check if original audio exists before mixing
+                        if audio_stream is not None:
+                            # Mix with original audio
+                            audio_stream = ffmpeg.filter([audio_stream, voiceover_stream], 'amix', inputs=2, duration='longest')
+                        else:
+                            # No original audio, use voiceover as main audio
+                            audio_stream = voiceover_stream
+                            
+                        logger.info(f"Successfully added voiceover for scene {scene.id}")
                     except Exception as e:
-                        logger.warning(f"Failed to add voiceover: {e}")
+                        logger.warning(f"Failed to add voiceover for scene {scene.id}: {e}")
 
                 audio_streams.append(audio_stream)
 
@@ -359,16 +421,46 @@ class VideoProcessor:
             # Apply transitions if specified
             if compose_request.transitions:
                 final_video = self._apply_transitions(video_streams, compose_request.transitions)
-                # For audio, simple concatenation for now
-                final_audio = ffmpeg.concat(*audio_streams, v=0, a=1) if len(audio_streams) > 1 else audio_streams[0]
+                # For audio, ensure proper stream handling for concatenation
+                if len(audio_streams) > 1:
+                    # Filter out None streams
+                    valid_audio_streams = [stream for stream in audio_streams if stream is not None]
+                    if len(valid_audio_streams) > 1:
+                        # Add asplit filters if needed to handle multiple outgoing edges
+                        processed_streams = []
+                        for i, stream in enumerate(valid_audio_streams):
+                            # Ensure each stream has a unique identity for concatenation
+                            stream = stream.filter('anull')
+                            processed_streams.append(stream)
+                        final_audio = ffmpeg.concat(*processed_streams, v=0, a=1)
+                    elif len(valid_audio_streams) == 1:
+                        final_audio = valid_audio_streams[0]
+                    else:
+                        # Create silent audio if no valid streams
+                        final_audio = ffmpeg.input('anullsrc=r=44100:cl=stereo', f='lavfi').audio
+                else:
+                    final_audio = audio_streams[0] if len(audio_streams) > 0 and audio_streams[0] is not None else ffmpeg.input('anullsrc=r=44100:cl=stereo', f='lavfi').audio
             else:
                 # Simple concatenation
                 if len(video_streams) > 1:
                     final_video = ffmpeg.concat(*video_streams, v=1, a=0)
-                    final_audio = ffmpeg.concat(*audio_streams, v=0, a=1)
+                    # Handle audio concatenation with proper stream separation
+                    valid_audio_streams = [stream for stream in audio_streams if stream is not None]
+                    if len(valid_audio_streams) > 1:
+                        # Add anull filter to ensure proper stream separation
+                        processed_streams = []
+                        for i, stream in enumerate(valid_audio_streams):
+                            stream = stream.filter('anull')
+                            processed_streams.append(stream)
+                        final_audio = ffmpeg.concat(*processed_streams, v=0, a=1)
+                    elif len(valid_audio_streams) == 1:
+                        final_audio = valid_audio_streams[0]
+                    else:
+                        # Create silent audio if no valid streams
+                        final_audio = ffmpeg.input('anullsrc=r=44100:cl=stereo', f='lavfi').audio
                 else:
                     final_video = video_streams[0]
-                    final_audio = audio_streams[0]
+                    final_audio = audio_streams[0] if len(audio_streams) > 0 and audio_streams[0] is not None else ffmpeg.input('anullsrc=r=44100:cl=stereo', f='lavfi').audio
             
             self._update_progress(job_id, 70, "processing", "Adding background music")
             
@@ -387,6 +479,10 @@ class VideoProcessor:
                         background_audio = background_audio.filter('afade', type='in', duration=music.fade_in)
                     if music.fade_out:
                         background_audio = background_audio.filter('afade', type='out', duration=music.fade_out)
+                    
+                    # Ensure proper stream isolation for mixing
+                    background_audio = background_audio.filter('anull')
+                    final_audio = final_audio.filter('anull')
                     
                     # Mix with existing audio using amix filter
                     final_audio = ffmpeg.filter([final_audio, background_audio], 'amix', inputs=2)
@@ -414,11 +510,18 @@ class VideoProcessor:
                 output_params['preset'] = 'fast'
             
             # Render final video
-            (ffmpeg
-             .output(final_video, final_audio, str(output_file), **output_params)
-             .overwrite_output()
-             .run(capture_stdout=True, capture_stderr=True)
-            )
+            try:
+                out, err = (ffmpeg
+                 .output(final_video, final_audio, str(output_file), **output_params)
+                 .overwrite_output()
+                 .run(capture_stdout=True, capture_stderr=True)
+                )
+                logger.info(f"FFmpeg completed successfully")
+            except ffmpeg.Error as e:
+                logger.error(f"FFmpeg error: {e}")
+                logger.error(f"FFmpeg stdout: {e.stdout.decode() if e.stdout else 'No stdout'}")
+                logger.error(f"FFmpeg stderr: {e.stderr.decode() if e.stderr else 'No stderr'}")
+                raise
             
             self._update_progress(job_id, 100, "completed", "Video composition completed successfully")
             logger.info(f"Video composition completed: {output_file}")

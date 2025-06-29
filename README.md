@@ -408,6 +408,28 @@ curl -X DELETE "http://localhost:8000/api/v1/jobs/123" \
 }
 ```
 
+### 9. Download Video
+
+**GET** `/api/v1/download/{job_id}`
+
+Download the completed video for a specific job.
+
+```bash
+curl -X GET "http://localhost:8000/api/v1/download/123" \
+  -H "Authorization: Bearer your-api-key-here" \
+  --output "video_123.mp4"
+```
+
+**Response:**
+- Returns the video file as a binary download
+- Content-Type: `video/mp4`
+- Filename: `video_{job_id}.mp4`
+
+**Requirements:**
+- Job must have status "completed"
+- User must own the job (authenticated via API key)
+- Output file must exist on server
+
 ## Supported File Formats
 
 ### Video Formats

@@ -1,7 +1,10 @@
 from fastapi import APIRouter, HTTPException, Depends, Query
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 from typing import Optional, List
 import logging
+import os
+from pathlib import Path
 from datetime import datetime
 
 from app.models import JobResponse, JobStatusResponse
@@ -161,3 +164,80 @@ async def cancel_job(
     except Exception as e:
         logger.error(f"Failed to cancel job {job_id}: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to cancel job")
+
+@router.get("/download/{job_id}")
+async def download_video(
+    job_id: int,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Download the completed video for a job.
+    
+    Args:
+        job_id: Job identifier
+        current_user: Authenticated user
+        db: Database session
+        
+    Returns:
+        FileResponse: The rendered video file
+        
+    Raises:
+        HTTPException: If job not found, access denied, not completed, or file not found
+    """
+    
+    try:
+        # Get job from database
+        job = db.query(Job).filter(
+            Job.id == job_id,
+            Job.api_key == current_user.api_key
+        ).first()
+        
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        
+        # Check if job is completed
+        if job.status != "completed":
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Job is not completed. Current status: {job.status}"
+            )
+        
+        # Check if output path exists
+        if not job.output_path:
+            raise HTTPException(
+                status_code=500, 
+                detail="No output file path found for this job"
+            )
+        
+        # Construct full file path
+        file_path = Path(job.output_path)
+        
+        # Check if file exists
+        if not file_path.exists():
+            logger.error(f"Output file not found: {file_path}")
+            raise HTTPException(
+                status_code=500, 
+                detail="Output file not found on server"
+            )
+        
+        # Generate filename for download
+        filename = f"video_{job_id}.mp4"
+        
+        logger.info(f"Serving download for job {job_id} to user {current_user.user_id}")
+        
+        return FileResponse(
+            path=str(file_path),
+            filename=filename,
+            media_type="video/mp4",
+            headers={
+                "Content-Disposition": f"attachment; filename={filename}",
+                "Cache-Control": "no-cache"
+            }
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to download file for job {job_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to download file")

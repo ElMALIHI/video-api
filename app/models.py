@@ -68,11 +68,51 @@ class TextOverlay(BaseModel):
     duration: Optional[float] = Field(None, ge=0.1, description="Duration in seconds")
     animation: Optional[str] = Field(None, description="Animation type")
 
+class Media(BaseModel):
+    type: MediaType = Field(..., description="Type of media")
+    file_id: str = Field(..., description="ID of uploaded media file")
+    start_time: Optional[float] = Field(None, ge=0, description="Start time for video clips")
+    end_time: Optional[float] = Field(None, ge=0, description="End time for video clips")
+    effects: Optional[MediaEffects] = Field(None, description="Media effects")
+
+    @validator('file_id')
+    def validate_file_id_uuid(cls, v):
+        try:
+            uuid.UUID(v)
+        except ValueError:
+            raise ValueError('file_id must be a valid UUID')
+        return v
+
+    @validator('end_time')
+    def validate_end_time(cls, v, values):
+        if v is not None and 'start_time' in values and values['start_time'] is not None:
+            if v <= values['start_time']:
+                raise ValueError('end_time must be greater than start_time')
+        return v
+
+
+class Audio(BaseModel):
+    """Legacy Audio model for backward compatibility"""
+    file_id: str = Field(..., description="ID of uploaded audio file")
+    volume: float = Field(default=1.0, ge=0.0, le=2.0, description="Volume level (0.0 to 2.0)")
+    fade_in: Optional[float] = Field(None, ge=0, description="Fade in duration in seconds")
+    fade_out: Optional[float] = Field(None, ge=0, description="Fade out duration in seconds")
+    
+    @validator('file_id')
+    def validate_file_id_uuid(cls, v):
+        try:
+            uuid.UUID(v)
+        except ValueError:
+            raise ValueError('file_id must be a valid UUID')
+        return v
+
+
 class Voiceover(BaseModel):
     file_id: str = Field(..., description="UUID of voiceover audio file")
     volume: float = Field(default=1.0, ge=0.0, le=2.0, description="Volume level (0.0 to 2.0)")
     start_time: Optional[float] = Field(None, ge=0, description="Start time in seconds")
     duration: Optional[float] = Field(None, ge=0.1, description="Duration in seconds")
+
 
 class Scene(BaseModel):
     id: str = Field(..., min_length=1, max_length=100, description="Unique scene identifier")
@@ -115,43 +155,6 @@ class AudioTrack(BaseModel):
         return v
 
 
-class Audio(BaseModel):
-    """Legacy Audio model for backward compatibility"""
-    file_id: str = Field(..., description="ID of uploaded audio file")
-    volume: float = Field(default=1.0, ge=0.0, le=2.0, description="Volume level (0.0 to 2.0)")
-    fade_in: Optional[float] = Field(None, ge=0, description="Fade in duration in seconds")
-    fade_out: Optional[float] = Field(None, ge=0, description="Fade out duration in seconds")
-    
-    @validator('file_id')
-    def validate_file_id_uuid(cls, v):
-        try:
-            uuid.UUID(v)
-        except ValueError:
-            raise ValueError('file_id must be a valid UUID')
-        return v
-
-
-class Media(BaseModel):
-    type: MediaType = Field(..., description="Type of media")
-    file_id: str = Field(..., description="ID of uploaded media file")
-    start_time: Optional[float] = Field(None, ge=0, description="Start time for video clips")
-    end_time: Optional[float] = Field(None, ge=0, description="End time for video clips")
-    effects: Optional[MediaEffects] = Field(None, description="Media effects")
-
-    @validator('file_id')
-    def validate_file_id_uuid(cls, v):
-        try:
-            uuid.UUID(v)
-        except ValueError:
-            raise ValueError('file_id must be a valid UUID')
-        return v
-
-    @validator('end_time')
-    def validate_end_time(cls, v, values):
-        if v is not None and 'start_time' in values and values['start_time'] is not None:
-            if v <= values['start_time']:
-                raise ValueError('end_time must be greater than start_time')
-        return v
 
 
 
@@ -297,18 +300,10 @@ class JobResponse(BaseModel):
 
 class ComposeResponse(BaseModel):
     """Response model for composition requests"""
-    job_id: str = Field(..., description="Unique job identifier (UUID)")
+    job_id: str = Field(..., description="Unique job identifier")
     message: str = Field(..., description="Success message")
     estimated_time: Optional[int] = Field(None, description="Estimated processing time in seconds")
     status: JobStatus = Field(default=JobStatus.PENDING, description="Initial job status")
-    
-    @validator('job_id')
-    def validate_job_id_uuid(cls, v):
-        try:
-            uuid.UUID(v)
-        except ValueError:
-            raise ValueError('job_id must be a valid UUID')
-        return v
 
 
 class HealthResponse(BaseModel):

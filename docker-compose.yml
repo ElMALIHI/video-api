@@ -10,8 +10,8 @@ services:
     depends_on:
       - redis
     volumes:
-      - ./media:/app/media
-      - ./uploads:/app/uploads
+      - ./media:/app/media:rw
+      - ./uploads:/app/uploads:rw
     env_file:
       - .env
 

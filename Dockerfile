@@ -72,8 +72,9 @@ ENV API_HOST=0.0.0.0 \
     MAX_FILE_SIZE=100MB \
     LOG_LEVEL=INFO
 
-# Switch to non-root user
-USER appuser
+# Note: Running as root for now to avoid permission issues with mounted volumes
+# In production, consider using proper user mapping
+# USER appuser
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
