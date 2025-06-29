@@ -329,11 +329,33 @@ class VideoProcessor:
                         audio_stream = ffmpeg.filter([audio_stream, scene_audio_stream], 'amix')
                     except Exception as e:
                         logger.warning(f"Failed to add scene audio: {e}")
-                
+
+                # Handle voiceover
+                if scene.voiceover:
+                    try:
+                        voiceover_path = self.get_file_path(scene.voiceover.file_id)
+                        voiceover_stream = ffmpeg.input(voiceover_path).audio
+
+                        # Apply volume
+                        if scene.voiceover.volume != 1.0:
+                            voiceover_stream = voiceover_stream.filter('volume', scene.voiceover.volume)
+
+                        # Apply timing constraints
+                        if scene.voiceover.start_time is not None:
+                            voiceover_stream = voiceover_stream.filter('adelay', delay=str(int(scene.voiceover.start_time * 1000)) + '|all=1')
+                        if scene.voiceover.duration is not None:
+                            voiceover_stream = voiceover_stream.filter('atrim', duration=scene.voiceover.duration)
+                            voiceover_stream = voiceover_stream.filter('asetpts', 'PTS-STARTPTS')
+
+                        # Mix with original audio
+                        audio_stream = ffmpeg.filter([audio_stream, voiceover_stream], 'amix')
+                    except Exception as e:
+                        logger.warning(f"Failed to add voiceover: {e}")
+
                 audio_streams.append(audio_stream)
-            
+
             self._update_progress(job_id, 50, "processing", "Applying transitions")
-            
+
             # Apply transitions if specified
             if compose_request.transitions:
                 final_video = self._apply_transitions(video_streams, compose_request.transitions)

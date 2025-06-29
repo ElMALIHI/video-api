@@ -70,14 +70,9 @@ def generate_file_id(filename: str, user_id: str) -> str:
         user_id: User identifier
         
     Returns:
-        str: Unique file ID
+        str: UUID file ID
     """
-    # Create a hash based on filename, user, and timestamp
-    hash_input = f"{filename}_{user_id}_{uuid.uuid4()}"
-    file_hash = hashlib.md5(hash_input.encode()).hexdigest()[:12]
-    
-    file_type = validate_file_type(filename)
-    return f"{file_type}_{file_hash}"
+    return str(uuid.uuid4())
 
 async def save_uploaded_file(upload_file: UploadFile, file_id: str) -> str:
     """

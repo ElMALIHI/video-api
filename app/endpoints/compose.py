@@ -47,6 +47,10 @@ def estimate_processing_time(request: CompositionRequest) -> int:
     text_overlay_count = sum(len(scene.text_overlays or []) for scene in request.scenes)
     text_time = text_overlay_count * 3
     
+    # Add time for voiceovers
+    voiceover_count = sum(1 for scene in request.scenes if scene.voiceover)
+    voiceover_time = voiceover_count * 5
+    
     # Add time for background music
     music_time = 10 if request.global_audio and request.global_audio.background_music else 0
     
@@ -57,7 +61,7 @@ def estimate_processing_time(request: CompositionRequest) -> int:
         "high": 1.5
     }.get(request.settings.quality, 1.0)
     
-    total_time = (base_time + scene_time + transition_time + text_time + music_time) * quality_multiplier
+    total_time = (base_time + scene_time + transition_time + text_time + voiceover_time + music_time) * quality_multiplier
     
     return int(total_time)
 
@@ -160,6 +164,8 @@ async def create_composition(
             file_ids.add(scene.media.file_id)
             if scene.audio:
                 file_ids.add(scene.audio.file_id)
+            if scene.voiceover:
+                file_ids.add(scene.voiceover.file_id)
         
         # Collect file IDs from global audio
         if request.global_audio and request.global_audio.background_music:

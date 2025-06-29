@@ -67,7 +67,21 @@ class TextOverlay(BaseModel):
     start_time: Optional[float] = Field(None, ge=0, description="Start time in seconds")
     duration: Optional[float] = Field(None, ge=0.1, description="Duration in seconds")
     animation: Optional[str] = Field(None, description="Animation type")
-    
+
+class Voiceover(BaseModel):
+    file_id: str = Field(..., description="UUID of voiceover audio file")
+    volume: float = Field(default=1.0, ge=0.0, le=2.0, description="Volume level (0.0 to 2.0)")
+    start_time: Optional[float] = Field(None, ge=0, description="Start time in seconds")
+    duration: Optional[float] = Field(None, ge=0.1, description="Duration in seconds")
+
+class Scene(BaseModel):
+    id: str = Field(..., min_length=1, max_length=100, description="Unique scene identifier")
+    duration: Optional[float] = Field(None, ge=0.1, description="Scene duration in seconds")
+    media: Media = Field(..., description="Main media for the scene")
+    audio: Optional[Audio] = Field(None, description="Scene-specific audio")
+    voiceover: Optional[Voiceover] = Field(None, description="Voiceover for the scene")
+    text_overlays: Optional[List[TextOverlay]] = Field(default=[], description="Text overlays for the scene")
+
     @validator('duration')
     def validate_duration(cls, v):
         if v is not None and v <= 0:
@@ -140,12 +154,6 @@ class Media(BaseModel):
         return v
 
 
-class Scene(BaseModel):
-    id: str = Field(..., min_length=1, max_length=100, description="Unique scene identifier")
-    duration: Optional[float] = Field(None, ge=0.1, description="Scene duration in seconds")
-    media: Media = Field(..., description="Main media for the scene")
-    audio: Optional[Audio] = Field(None, description="Scene-specific audio")
-    text_overlays: Optional[List[TextOverlay]] = Field(default=[], description="Text overlays for the scene")
 
 
 class Transition(BaseModel):
